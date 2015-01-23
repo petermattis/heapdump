@@ -448,6 +448,7 @@ func (p *Printer) printInterfaceAt(t *dwarf.InterfaceType, a address) {
 		if err != nil {
 			p.errorf("%s", err)
 		} else {
+			// TODO(pmattis): This is completely hacky. Fix.
 			start := p.printBuf.Len()
 			p.printTypeOfInterface(f.Type, tab)
 			end := p.printBuf.Len()
