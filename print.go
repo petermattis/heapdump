@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"strings"
 
 	"golang.org/x/debug/dwarf"
 	"golang.org/x/debug/ogle/arch"
@@ -36,6 +37,7 @@ type Printer struct {
 	printBuf bytes.Buffer            // Accumulates the output.
 	tmp      []byte                  // Temporary used for I/O.
 	visited  map[typeAndAddress]bool // Prevents looping on cyclic data.
+	types    map[string]dwarf.Type
 }
 
 // printf prints to printBuf.
@@ -92,6 +94,20 @@ func (p *Printer) peekUint(addr address, s int64) (uint64, bool) {
 	return 0, false
 }
 
+func (p *Printer) peekAddrStructField(t *dwarf.StructType, addr address, fieldName string) (address, bool) {
+	f, err := getField(t, fieldName)
+	if err != nil {
+		p.errorf("%s", err)
+		return 0, false
+	}
+	_, ok := f.Type.(*dwarf.PtrType)
+	if !ok {
+		p.errorf("struct field %s is not a pointer", fieldName)
+		return 0, false
+	}
+	return addr + address(f.ByteOffset), true
+}
+
 // peekPtrStructField reads a pointer in the field fieldName of the struct
 // of type t at address addr.
 func (p *Printer) peekPtrStructField(t *dwarf.StructType, addr address, fieldName string) (address, bool) {
@@ -145,6 +161,39 @@ type Peeker interface {
 	peek(offset uintptr, buf []byte) error
 }
 
+func makeTypeMap(d *dwarf.Data) map[string]dwarf.Type {
+	m := map[string]dwarf.Type{}
+	for r := d.Reader(); true; {
+		e, err := r.Next()
+		if err != nil || e == nil {
+			break
+		}
+
+		switch e.Tag {
+		case dwarf.TagArrayType,
+			dwarf.TagBaseType,
+			dwarf.TagClassType,
+			dwarf.TagEnumerationType,
+			dwarf.TagPointerType,
+			dwarf.TagReferenceType,
+			dwarf.TagStructType,
+			dwarf.TagSubroutineType,
+			dwarf.TagTypedef,
+			dwarf.TagUnspecifiedType:
+			name := e.Val(dwarf.AttrName).(string)
+			if strings.Contains(name, "runtime") {
+				break
+			}
+			typ, err := d.Type(e.Offset)
+			if err != nil {
+				break
+			}
+			m[name] = typ
+		}
+	}
+	return m
+}
+
 // NewPrinter returns a printer that can use the Peeker to access and print
 // values of the specified architecture described by the provided DWARF data.
 func NewPrinter(arch *arch.Architecture, dwarf *dwarf.Data, peeker Peeker) *Printer {
@@ -154,6 +203,7 @@ func NewPrinter(arch *arch.Architecture, dwarf *dwarf.Data, peeker Peeker) *Prin
 		dwarf:   dwarf,
 		visited: make(map[typeAndAddress]bool),
 		tmp:     make([]byte, 100), // Enough for a largish string.
+		types:   makeTypeMap(dwarf),
 	}
 }
 
@@ -264,7 +314,17 @@ func (p *Printer) printValueAt(typ dwarf.Type, a address) {
 		}
 	case *dwarf.PtrType:
 		if ptr, ok := p.peekPtr(a); ok {
-			p.printf("%#x", ptr)
+			if ptr == 0 {
+				p.printf("<nil>")
+			} else {
+				name := typ.Type.String()
+				if strings.Contains(name, "runtime") || name == "void" {
+					p.printf("%#x", ptr)
+				} else {
+					p.printf("&")
+					p.printValueAt(typ.Type, ptr)
+				}
+			}
 		} else {
 			p.errorf("couldn't read pointer")
 		}
@@ -317,7 +377,7 @@ func (p *Printer) printValueAt(typ dwarf.Type, a address) {
 			p.errorf("can't handle struct type %s", typ.Kind)
 			return
 		}
-		p.printf("%s {", typ.String())
+		p.printf("%s {", strings.TrimPrefix(typ.String(), "struct "))
 		for i, field := range typ.Field {
 			if i != 0 {
 				p.printf(", ")
@@ -374,37 +434,43 @@ func (p *Printer) printArrayAt(typ *dwarf.ArrayType, a address) {
 }
 
 func (p *Printer) printInterfaceAt(t *dwarf.InterfaceType, a address) {
-	// t should be a typedef binding a typedef binding a struct.
-	tt, ok := t.TypedefType.Type.(*dwarf.TypedefType)
+	// t should be a typedef binding a struct.
+	st, ok := t.TypedefType.Type.(*dwarf.StructType)
 	if !ok {
 		p.errorf("bad interface type: not a typedef")
 		return
 	}
-	st, ok := tt.Type.(*dwarf.StructType)
-	if !ok {
-		p.errorf("bad interface type: not a typedef of a struct")
-		return
-	}
 	p.printf("(")
 	tab, ok := p.peekPtrStructField(st, a, "tab")
+	var typename string
 	if ok {
 		f, err := getField(st, "tab")
 		if err != nil {
 			p.errorf("%s", err)
 		} else {
+			start := p.printBuf.Len()
 			p.printTypeOfInterface(f.Type, tab)
+			end := p.printBuf.Len()
+			typename = string(p.printBuf.Bytes()[start+1 : end-1])
 		}
 	} else {
 		p.errorf("couldn't read interface type")
 	}
 	p.printf(", ")
-	data, ok := p.peekPtrStructField(st, a, "data")
+	addr, ok := p.peekAddrStructField(st, a, "data")
 	if !ok {
 		p.errorf("couldn't read interface value")
-	} else if data == 0 {
-		p.printf("<nil>")
 	} else {
-		p.printf("%#x", data)
+		if typ, ok := p.types[typename]; ok {
+			p.printValueAt(typ, addr)
+		} else {
+			data, ok := p.peekPtr(addr)
+			if !ok {
+				p.errorf("couldn't read interface value")
+			} else {
+				p.printf("%#x", data)
+			}
+		}
 	}
 	p.printf(")")
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -762,7 +763,7 @@ func (d *Dump) peek(offset uintptr, buf []byte) error {
 		}
 	}
 	for _, obj := range d.objects {
-		if off64 >= obj.addr && off64 < obj.addr+len64 {
+		if off64 >= obj.addr && off64 < obj.addr+uint64(len(obj.contents)) {
 			off64 -= obj.addr
 			copy(buf, obj.contents[off64:off64+len64])
 			// fmt.Printf("peek(obj): %#08x %d: %v\n", offset, len(buf), buf)
@@ -779,7 +780,22 @@ func (d *Dump) peek(offset uintptr, buf []byte) error {
 			}
 		}
 	}
-	return fmt.Errorf("ERROR: %#08x %d: not found\n", offset, len(buf))
+	if len(buf) == int(d.ptrSize) {
+		for addr, typ := range d.itabs {
+			if off64 == addr+d.ptrSize {
+				switch d.ptrSize {
+				case 4:
+					d.byteOrder.PutUint32(buf, uint32(typ.Addr))
+				case 8:
+					d.byteOrder.PutUint64(buf, typ.Addr)
+				}
+				return nil
+			}
+		}
+	}
+	fmt.Printf("ERROR: %#08x %d: not found\n", offset, len(buf))
+	return fmt.Errorf("%#08x %d: not found\n", offset, len(buf))
+	// fmt.Printf("ERROR: %#08x %d: not found\n", offset, len(buf))
 	// for i := range buf {
 	// 	buf[i] = 0
 	// }
@@ -805,12 +821,12 @@ func (d *Dump) link(exename string) error {
 	}
 
 	for _, g := range d.goroutines {
-		if g.goid != 5 {
-			continue
-		}
+		// if g.goid != 5 {
+		// 	continue
+		// }
 		fmt.Printf("goroutine %d\n", g.goid)
 		for _, f := range g.frames {
-			fmt.Printf("  %s: %#08x %d\n", f.name, f.sp, len(f.contents))
+			fmt.Printf("  %s\n", f.name)
 			vals, ok := locals[f.name]
 			if !ok {
 				continue
@@ -828,7 +844,7 @@ func (d *Dump) link(exename string) error {
 				}
 				s, err := printer.SprintEntry(v.entry, addr)
 				if err != nil {
-					fmt.Printf("    %4d %s [%s]\n", v.offset, v.name, err)
+					fmt.Printf("    %4d %s %s [%s]\n", v.offset, v.name, s, err)
 					continue
 				}
 				fmt.Printf("    %4d %s %v %s\n", v.offset, v.name, typ, s)
@@ -850,22 +866,20 @@ func (d *Dump) uintptr(buf []byte) uint64 {
 	panic(fmt.Errorf("invalid pointer size: %d", d.ptrSize))
 }
 
-func baz(a error) {
-	fmt.Print(a)
+func baz(a error, b int, c string) {
 	select {}
 }
 
-func bar(a error) {
-	baz(a)
+func bar(a error, b int) {
+	baz(a, b, "world")
 }
 
 func foo(a error) {
-	bar(a)
+	bar(a, 1)
 }
 
 func boo() {
-	foo(fmt.Errorf("hello\n"))
-	time.Sleep(1)
+	foo(errors.New("hello"))
 }
 
 func main() {
