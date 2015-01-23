@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"debug/gosym"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ type Objfile struct {
 	architecture *arch.Architecture
 	dwarfData    *dwarf.Data
 	rodata       *Data
+	symtab       *gosym.Table
 }
 
 func loadObjfile(path string) (*Objfile, error) {
@@ -61,17 +63,42 @@ func loadObjfile(path string) (*Objfile, error) {
 			return nil, err
 		}
 
-		for _, s := range obj.Sections {
-			if s.Name == "__rodata" {
-				f.rodata = &Data{}
-				f.rodata.Start = s.Addr
-				f.rodata.End = s.Addr + s.Size
-				f.rodata.Data, err = s.Data()
-				if err != nil {
-					return nil, err
-				}
-				break
+		// TODO(pmattis): What about __noptrdata and __noptrbss
+
+		if s := obj.Section("__rodata"); s != nil {
+			f.rodata = &Data{}
+			f.rodata.Start = s.Addr
+			f.rodata.End = s.Addr + s.Size
+			f.rodata.Data, err = s.Data()
+			if err != nil {
+				return nil, err
 			}
+		}
+
+		var (
+			symdat  []byte
+			pclndat []byte
+			err     error
+		)
+
+		if s := obj.Section("__gosymtab"); s != nil {
+			symdat, err = s.Data()
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if s := obj.Section("__gopclntab"); s != nil {
+			pclndat, err = s.Data()
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		pcln := gosym.NewLineTable(pclndat, obj.Section("__text").Addr)
+		f.symtab, err = gosym.NewTable(symdat, pcln)
+		if err != nil {
+			return nil, err
 		}
 
 		switch obj.Cpu {
@@ -793,9 +820,8 @@ func (d *Dump) peek(offset uintptr, buf []byte) error {
 			}
 		}
 	}
-	fmt.Printf("ERROR: %#08x %d: not found\n", offset, len(buf))
-	return fmt.Errorf("%#08x %d: not found\n", offset, len(buf))
 	// fmt.Printf("ERROR: %#08x %d: not found\n", offset, len(buf))
+	return fmt.Errorf("%#08x %d: not found\n", offset, len(buf))
 	// for i := range buf {
 	// 	buf[i] = 0
 	// }
@@ -820,13 +846,21 @@ func (d *Dump) link(exename string) error {
 		return err
 	}
 
+	// fmt.Printf("data:   %d\n", len(d.data.Data))
+	// fmt.Printf("rodata: %d\n", len(d.rodata.Data))
+	// fmt.Printf("bss:    %d\n", len(d.bss.Data))
+
 	for _, g := range d.goroutines {
 		// if g.goid != 5 {
 		// 	continue
 		// }
 		fmt.Printf("goroutine %d\n", g.goid)
 		for _, f := range g.frames {
-			fmt.Printf("  %s\n", f.name)
+			if file, line, fn := obj.symtab.PCToLine(f.pc - 1); fn != nil {
+				fmt.Printf("  %s [%s:%d]\n", f.name, file, line)
+			} else {
+				fmt.Printf("  %s\n", f.name)
+			}
 			vals, ok := locals[f.name]
 			if !ok {
 				continue
@@ -836,12 +870,7 @@ func (d *Dump) link(exename string) error {
 				if err != nil {
 					continue
 				}
-				var addr address
-				if v.offset < 0 {
-					addr = address(int64(f.sp) + int64(len(f.contents)) + v.offset)
-				} else {
-					addr = address(int64(f.sp) + int64(len(f.contents)) + v.offset)
-				}
+				addr := address(int64(f.sp) + int64(len(f.contents)) + v.offset)
 				s, err := printer.SprintEntry(v.entry, addr)
 				if err != nil {
 					fmt.Printf("    %4d %s %s [%s]\n", v.offset, v.name, s, err)
