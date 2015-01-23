@@ -2,9 +2,6 @@ package main
 
 import (
 	"bufio"
-	"debug/dwarf"
-	"debug/elf"
-	"debug/macho"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -13,23 +10,79 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"time"
+
+	"golang.org/x/debug/dwarf"
+	"golang.org/x/debug/elf"
+	"golang.org/x/debug/macho"
+	"golang.org/x/debug/ogle/arch"
 )
 
-func loadDwarf(path string) (d *dwarf.Data, err error) {
+// Objfile ...
+type Objfile struct {
+	architecture *arch.Architecture
+	dwarfData    *dwarf.Data
+	rodata       *Data
+}
+
+func loadObjfile(path string) (*Objfile, error) {
+	f := &Objfile{}
 	if obj, err := elf.Open(path); err == nil {
-		d, err = obj.DWARF()
+		f.dwarfData, err = obj.DWARF()
 		if err != nil {
 			return nil, err
 		}
-		return d, nil
+
+		// TODO(pmattis): Find rodata section.
+
+		switch obj.Machine {
+		case elf.EM_ARM:
+			f.architecture = &arch.ARM
+		case elf.EM_386:
+			switch obj.Class {
+			case elf.ELFCLASS32:
+				f.architecture = &arch.X86
+			case elf.ELFCLASS64:
+				f.architecture = &arch.AMD64
+			}
+		case elf.EM_X86_64:
+			f.architecture = &arch.AMD64
+		}
+		if f.architecture == nil {
+			return nil, fmt.Errorf("unrecognized ELF architecture")
+		}
+		return f, nil
 	}
 
 	if obj, err := macho.Open(os.Args[0]); err == nil {
-		d, err = obj.DWARF()
+		f.dwarfData, err = obj.DWARF()
 		if err != nil {
 			return nil, err
 		}
-		return d, nil
+
+		for _, s := range obj.Sections {
+			if s.Name == "__rodata" {
+				f.rodata = &Data{}
+				f.rodata.Start = s.Addr
+				f.rodata.End = s.Addr + s.Size
+				f.rodata.Data, err = s.Data()
+				if err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+
+		switch obj.Cpu {
+		case macho.Cpu386:
+			f.architecture = &arch.X86
+		case macho.CpuAmd64:
+			f.architecture = &arch.AMD64
+		}
+		if f.architecture == nil {
+			return nil, fmt.Errorf("unrecognized Mach-O architecture")
+		}
+		return f, nil
 	}
 
 	return nil, fmt.Errorf("unrecognized binary format")
@@ -179,6 +232,7 @@ type Dump struct {
 	experiment   string
 	ncpu         uint
 	data         Data
+	rodata       Data
 	bss          Data
 	objects      map[uint64]Object
 	goroutines   []*Goroutine
@@ -188,8 +242,6 @@ type Dump struct {
 	types        map[uint64]Type
 	itabs        map[uint64]Type
 	memStats     *runtime.MemStats
-	dwarf        *dwarf.Data
-	globalVars   map[uint64]dwarf.Type
 }
 
 // Type ...
@@ -202,7 +254,8 @@ type Type struct {
 
 // Data ...
 type Data struct {
-	Addr   uint64
+	Start  uint64
+	End    uint64
 	Data   []byte
 	Fields []Field
 }
@@ -314,32 +367,21 @@ func read(f *os.File, exename string) (*Dump, error) {
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("%s\n", hdr)
 	if string(hdr) != "go1.4 heap dump" {
 		return nil, fmt.Errorf("unexpected heap dump format: %s", hdr)
 	}
 
 	d := &Dump{
-		objects:    map[uint64]Object{},
-		memprof:    map[uint64]*MemProfEntry{},
-		types:      map[uint64]Type{},
-		itabs:      map[uint64]Type{},
-		globalVars: map[uint64]dwarf.Type{},
+		objects: map[uint64]Object{},
+		memprof: map[uint64]*MemProfEntry{},
+		types:   map[uint64]Type{},
+		itabs:   map[uint64]Type{},
 	}
-	d.dwarf, err = loadDwarf(exename)
-	if err != nil {
-		return nil, err
-	}
-
 	if err := d.readTags(r); err != nil {
 		return nil, err
 	}
 
-	// if err := d.initGlobalVars(); err != nil {
-	// 	return nil, err
-	// }
-
-	if err := d.link(); err != nil {
+	if err := d.link(exename); err != nil {
 		return nil, err
 	}
 
@@ -353,7 +395,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 		t := tag(readUint64(r))
 		switch t {
 		case tagEOF:
-			fmt.Printf("%v\n", t)
+			// fmt.Printf("%v\n", t)
 			return nil
 
 		case tagObject:
@@ -362,12 +404,12 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			o.contents = readBytes(r)
 			o.fields = readFields(r)
 			d.objects[o.addr] = o
-			fmt.Printf("%v: %#08x: %d %d\n", t, o.addr, len(o.contents), len(o.fields))
+			// fmt.Printf("%v: %#08x: %d %d\n", t, o.addr, len(o.contents), len(o.fields))
 
 		case tagOtherRoot:
-			desc := readString(r)
+			_ = readString(r)
 			_ = readUint64(r)
-			fmt.Printf("%v: %s", t, desc)
+			// fmt.Printf("%v: %s", t, desc)
 
 		case tagType:
 			typ := Type{}
@@ -376,7 +418,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			typ.Name = readString(r)
 			typ.Ptr = readBool(r)
 			d.types[typ.Addr] = typ
-			fmt.Printf("%v: %#08x %d %s %v\n", t, typ.Addr, typ.Size, typ.Name, typ.Ptr)
+			// fmt.Printf("%v: %#08x %d %s %v\n", t, typ.Addr, typ.Size, typ.Name, typ.Ptr)
 
 		case tagGoroutine:
 			g := &Goroutine{}
@@ -396,7 +438,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			d.goroutines = append(d.goroutines, g)
 			gmap[g.sp] = g
 			gmap[g.addr] = g
-			fmt.Printf("%v: %d %#08x %#08x\n", t, g.goid, g.sp, g.addr)
+			// fmt.Printf("%v: %d %#08x %#08x\n", t, g.goid, g.sp, g.addr)
 
 		case tagStackFrame:
 			f := StackFrame{}
@@ -424,7 +466,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			}
 			gmap[f.sp] = g
 			g.frames = append(g.frames, f)
-			fmt.Printf("%v: %d %s %#08x %#08x %d\n", t, g.goid, f.name, f.sp, f.childsp, f.depth)
+			// fmt.Printf("%v: %d %s %#08x %#08x %d\n", t, g.goid, f.name, f.sp, f.childsp, f.depth)
 
 		case tagParams:
 			if readBool(r) {
@@ -438,7 +480,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			d.theChar = byte(readUint64(r))
 			d.experiment = readString(r)
 			d.ncpu = uint(readUint64(r))
-			fmt.Printf("%v: ptrSize=%d heap=%#08x-%#08x\n", t, d.ptrSize, d.heapStart, d.heapEnd)
+			// fmt.Printf("%v: ptrSize=%d heap=%#08x-%#08x\n", t, d.ptrSize, d.heapStart, d.heapEnd)
 
 		case tagFinalizer, tagQueuedFinalizer:
 			f := Finalizer{}
@@ -457,7 +499,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			} else {
 				obj.qfinalizers = append(obj.qfinalizers, f)
 			}
-			fmt.Printf("%v: %#08x\n", t, addr)
+			// fmt.Printf("%v: %#08x\n", t, addr)
 
 		case tagItab:
 			addr := readUint64(r)
@@ -468,7 +510,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 				break
 			}
 			d.itabs[addr] = typ
-			fmt.Printf("%v: %#08x %#08x (%s)\n", t, addr, typeAddr, typ.Name)
+			// fmt.Printf("%v: %#08x %#08x (%s)\n", t, addr, typeAddr, typ.Name)
 
 		case tagOSThread:
 			thr := Thread{}
@@ -476,7 +518,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			thr.ID = readUint64(r)
 			thr.ProcID = readUint64(r)
 			d.threads = append(d.threads, thr)
-			fmt.Printf("%v: %#08x %d %d\n", t, thr.Addr, thr.ID, thr.ProcID)
+			// fmt.Printf("%v: %#08x %d %d\n", t, thr.Addr, thr.ID, thr.ProcID)
 
 		case tagMemStats:
 			s := &runtime.MemStats{}
@@ -509,7 +551,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			}
 			s.NumGC = uint32(readUint64(r))
 			d.memStats = s
-			fmt.Printf("%v: %+v\n", t, s)
+			// fmt.Printf("%v: %+v\n", t, s)
 
 		case tagData, tagBSS:
 			var dat *Data
@@ -518,22 +560,11 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			} else {
 				dat = &d.bss
 			}
-			dat.Addr = readUint64(r)
+			dat.Start = readUint64(r)
 			dat.Data = readBytes(r)
 			dat.Fields = readFields(r)
-			fmt.Printf("%v: %#08x %d %d\n", t, dat.Addr, len(dat.Data), len(dat.Fields))
-
-			// TODO(pmattis): Instead of walking over the fields, we should
-			// walk over the global variables and print out the contents
-			// using ogle/printer.go.
-			// for _, f := range dat.Fields {
-			// 	addr := dat.Addr + f.offset
-			// 	typ, ok := d.globalVars[addr]
-			// 	if !ok {
-			// 		continue
-			// 	}
-			// 	fmt.Printf("  %#08x: %v\n", addr, typ)
-			// }
+			dat.End = dat.Start + uint64(len(dat.Data))
+			// fmt.Printf("%v: %#08x %d %d\n", t, dat.Addr, len(dat.Data), len(dat.Fields))
 
 		case tagDefer:
 			q := Defer{}
@@ -550,7 +581,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 				break
 			}
 			g.defers = append(g.defers, q)
-			fmt.Printf("%v: %d\n", t, g.goid)
+			// fmt.Printf("%v: %d\n", t, g.goid)
 
 		case tagPanic:
 			q := Panic{}
@@ -566,7 +597,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 				break
 			}
 			g.panics = append(g.panics, q)
-			fmt.Printf("%v: %d\n", t, g.goid)
+			// fmt.Printf("%v: %d\n", t, g.goid)
 
 		case tagMemProf:
 			e := &MemProfEntry{}
@@ -582,7 +613,7 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			e.allocs = readUint64(r)
 			e.frees = readUint64(r)
 			d.memprof[e.addr] = e
-			fmt.Printf("%v: %#08x\n", t, e.addr)
+			// fmt.Printf("%v: %#08x\n", t, e.addr)
 
 		case tagAllocSample:
 			s := AllocSample{}
@@ -595,44 +626,217 @@ func (d *Dump) readTags(r *bufio.Reader) error {
 			}
 			s.Prof = prof
 			d.allocSamples = append(d.allocSamples, s)
-			fmt.Printf("%v: %#08x %+v\n", t, s.Addr, s.Prof)
+			// fmt.Printf("%v: %#08x %+v\n", t, s.Addr, s.Prof)
 		}
 	}
 }
 
-func (d *Dump) initGlobalVars() error {
-	const opAddr = 0x03
-	for r := d.dwarf.Reader(); true; {
-		entry, err := r.Next()
-		if err != nil {
-			return err
-		}
-		if entry == nil {
+const (
+	opCallFrameCFA = 0x9c
+	opConsts       = 0x11
+	opPlus         = 0x22
+	opAddr         = 0x03
+)
+
+func readUleb(b []byte) ([]byte, uint64) {
+	r := uint64(0)
+	s := uint(0)
+	for {
+		x := b[0]
+		b = b[1:]
+		r |= uint64(x&127) << s
+		if x&128 == 0 {
 			break
 		}
-		if entry.Tag != dwarf.TagVariable {
-			continue
-		}
-		typ, err := d.dwarf.Type(entry.Val(dwarf.AttrType).(dwarf.Offset))
-		if err != nil {
-			fmt.Printf("ERROR: unable to find type: %s\n", entry.Val(dwarf.AttrName))
-			continue
-		}
-		locexpr, ok := entry.Val(dwarf.AttrLocation).([]byte)
-		if !ok {
-			continue
-		}
-		if len(locexpr) == 0 || locexpr[0] != opAddr {
-			continue
-		}
-		addr := d.uintptr(locexpr[1:])
-		d.globalVars[addr] = typ
-		fmt.Printf("%#08x: %s: %v\n", addr, entry.Val(dwarf.AttrName), typ)
+		s += 7
+
 	}
-	return nil
+	return b, r
 }
 
-func (d *Dump) link() error {
+func readSleb(b []byte) ([]byte, int64) {
+	c, v := readUleb(b)
+	// sign extend
+	k := (len(b) - len(c)) * 7
+	return c, int64(v) << uint(64-k) >> uint(64-k)
+}
+
+// func (d *Dump) initGlobalVars() error {
+// 	const opAddr = 0x03
+// 	for r := d.dwarf.Reader(); true; {
+// 		entry, err := r.Next()
+// 		if err != nil {
+// 			return err
+// 		}
+// 		if entry == nil {
+// 			break
+// 		}
+// 		if entry.Tag != dwarf.TagVariable {
+// 			continue
+// 		}
+// 		typ, err := d.dwarf.Type(entry.Val(dwarf.AttrType).(dwarf.Offset))
+// 		if err != nil {
+// 			fmt.Printf("ERROR: unable to find type: %s\n", entry.Val(dwarf.AttrName))
+// 			continue
+// 		}
+// 		locexpr, ok := entry.Val(dwarf.AttrLocation).([]byte)
+// 		if !ok {
+// 			continue
+// 		}
+// 		if len(locexpr) == 0 || locexpr[0] != opAddr {
+// 			continue
+// 		}
+// 		addr := d.uintptr(locexpr[1:])
+// 		d.globalVars[addr] = typ
+// 		fmt.Printf("%#08x: %s: %v\n", addr, entry.Val(dwarf.AttrName), typ)
+// 	}
+// 	return nil
+// }
+
+type localValue struct {
+	name   string
+	offset int64
+	entry  *dwarf.Entry
+}
+
+type localsMap map[string][]localValue
+
+func makeLocalsMap(d *dwarf.Data) (localsMap, error) {
+	m := localsMap{}
+	var funcname string
+	var vals []localValue
+	for r := d.Reader(); true; {
+		e, err := r.Next()
+		if err != nil {
+			return nil, err
+		}
+		if e == nil {
+			break
+		}
+		switch e.Tag {
+		case 0:
+			m[funcname] = vals
+			funcname = ""
+		case dwarf.TagSubprogram:
+			funcname = e.Val(dwarf.AttrName).(string)
+			vals = m[funcname]
+		case dwarf.TagVariable, dwarf.TagFormalParameter:
+			name, ok := e.Val(dwarf.AttrName).(string)
+			if !ok {
+				break
+			}
+			loc := e.Val(dwarf.AttrLocation).([]uint8)
+			if len(loc) == 0 || loc[0] != opCallFrameCFA {
+				break
+			}
+			var offset int64
+			if len(loc) == 1 {
+				offset = 0
+			} else if len(loc) >= 3 && loc[1] == opConsts && loc[len(loc)-1] == opPlus {
+				loc, offset = readSleb(loc[2 : len(loc)-1])
+				if len(loc) != 0 {
+					break
+				}
+			}
+			vals = append(vals, localValue{name, offset, e})
+		}
+	}
+	return m, nil
+}
+
+func (d *Dump) peek(offset uintptr, buf []byte) error {
+	if offset == 0 {
+		for i := range buf {
+			buf[i] = 0
+		}
+		return nil
+	}
+	off64 := uint64(offset)
+	len64 := uint64(len(buf))
+	for _, data := range []*Data{&d.data, &d.rodata, &d.bss} {
+		if off64 >= data.Start && off64 < data.End {
+			off64 -= data.Start
+			copy(buf, data.Data[off64:off64+len64])
+			// fmt.Printf("peek(data): %#08x %d: %v\n", offset, len(buf), buf)
+			return nil
+		}
+	}
+	for _, obj := range d.objects {
+		if off64 >= obj.addr && off64 < obj.addr+len64 {
+			off64 -= obj.addr
+			copy(buf, obj.contents[off64:off64+len64])
+			// fmt.Printf("peek(obj): %#08x %d: %v\n", offset, len(buf), buf)
+			return nil
+		}
+	}
+	for _, g := range d.goroutines {
+		for _, f := range g.frames {
+			if off64 >= f.sp && off64 < f.sp+uint64(len(f.contents)) {
+				off64 -= f.sp
+				copy(buf, f.contents[off64:off64+len64])
+				// fmt.Printf("peek(%d/%s): %#08x %d: %v\n", g.goid, f.name, offset, len(buf), buf)
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("ERROR: %#08x %d: not found\n", offset, len(buf))
+	// for i := range buf {
+	// 	buf[i] = 0
+	// }
+	// return nil
+}
+
+func (d *Dump) link(exename string) error {
+	obj, err := loadObjfile(exename)
+	if err != nil {
+		return err
+	}
+	// dumpDwarf(obj.dwarfData, obj.dwarfData.Reader(), "")
+
+	if obj.rodata != nil {
+		d.rodata = *obj.rodata
+	}
+
+	printer := NewPrinter(obj.architecture, obj.dwarfData, d)
+
+	locals, err := makeLocalsMap(obj.dwarfData)
+	if err != nil {
+		return err
+	}
+
+	for _, g := range d.goroutines {
+		if g.goid != 5 {
+			continue
+		}
+		fmt.Printf("goroutine %d\n", g.goid)
+		for _, f := range g.frames {
+			fmt.Printf("  %s: %#08x %d\n", f.name, f.sp, len(f.contents))
+			vals, ok := locals[f.name]
+			if !ok {
+				continue
+			}
+			for _, v := range vals {
+				typ, err := obj.dwarfData.Type(v.entry.Val(dwarf.AttrType).(dwarf.Offset))
+				if err != nil {
+					continue
+				}
+				var addr address
+				if v.offset < 0 {
+					addr = address(int64(f.sp) + int64(len(f.contents)) + v.offset)
+				} else {
+					addr = address(int64(f.sp) + int64(len(f.contents)) + v.offset)
+				}
+				s, err := printer.SprintEntry(v.entry, addr)
+				if err != nil {
+					fmt.Printf("    %4d %s [%s]\n", v.offset, v.name, err)
+					continue
+				}
+				fmt.Printf("    %4d %s %v %s\n", v.offset, v.name, typ, s)
+			}
+		}
+		fmt.Println()
+	}
+
 	return nil
 }
 
@@ -646,7 +850,28 @@ func (d *Dump) uintptr(buf []byte) uint64 {
 	panic(fmt.Errorf("invalid pointer size: %d", d.ptrSize))
 }
 
+func baz(a error) {
+	fmt.Print(a)
+	select {}
+}
+
+func bar(a error) {
+	baz(a)
+}
+
+func foo(a error) {
+	bar(a)
+}
+
+func boo() {
+	foo(fmt.Errorf("hello\n"))
+	time.Sleep(1)
+}
+
 func main() {
+	go boo()
+	time.Sleep(1)
+
 	f, err := ioutil.TempFile(".", "heapdump.")
 	if err != nil {
 		log.Fatal(err)
@@ -665,10 +890,4 @@ func main() {
 	if _, err := read(f, os.Args[0]); err != nil {
 		log.Fatal(err)
 	}
-
-	// d, err := loadDwarf(os.Args[0])
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// dumpDwarf(d, d.Reader(), "")
 }
