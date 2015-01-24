@@ -871,6 +871,10 @@ func (d *Dump) link(exename string) error {
 					continue
 				}
 				addr := address(int64(f.sp) + int64(len(f.contents)) + v.offset)
+				// TODO(pmattis): We currently can't print values in the
+				// "first" function invoked by a goroutine because the
+				// arguments are stored in the parent frame but the parent
+				// frame isn't properly sized.
 				s, err := printer.SprintEntry(v.entry, addr)
 				if err != nil {
 					fmt.Printf("    %4d %s %s [%s]\n", v.offset, v.name, s, err)
