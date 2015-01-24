@@ -12,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"golang.org/x/debug/dwarf"
@@ -25,6 +26,8 @@ type Objfile struct {
 	architecture *arch.Architecture
 	dwarfData    *dwarf.Data
 	rodata       *Data
+	noptrdata    *Data
+	noptrbss     *Data
 	symtab       *gosym.Table
 }
 
@@ -63,13 +66,34 @@ func loadObjfile(path string) (*Objfile, error) {
 			return nil, err
 		}
 
-		// TODO(pmattis): What about __noptrdata and __noptrbss
+		// TODO(pmattis): Reduce duplicated code in handling of __rodata,
+		// __noptrdata and __noptrbss.
 
 		if s := obj.Section("__rodata"); s != nil {
 			f.rodata = &Data{}
 			f.rodata.Start = s.Addr
 			f.rodata.End = s.Addr + s.Size
 			f.rodata.Data, err = s.Data()
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if s := obj.Section("__noptrdata"); s != nil {
+			f.noptrdata = &Data{}
+			f.noptrdata.Start = s.Addr
+			f.noptrdata.End = s.Addr + s.Size
+			f.noptrdata.Data, err = s.Data()
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if s := obj.Section("__noptrbss"); s != nil {
+			f.noptrbss = &Data{}
+			f.noptrbss.Start = s.Addr
+			f.noptrbss.End = s.Addr + s.Size
+			f.noptrbss.Data, err = s.Data()
 			if err != nil {
 				return nil, err
 			}
@@ -261,6 +285,8 @@ type Dump struct {
 	ncpu         uint
 	data         Data
 	rodata       Data
+	noptrdata    Data
+	noptrbss     Data
 	bss          Data
 	objects      map[uint64]Object
 	goroutines   []*Goroutine
@@ -781,7 +807,7 @@ func (d *Dump) peek(offset uintptr, buf []byte) error {
 	}
 	off64 := uint64(offset)
 	len64 := uint64(len(buf))
-	for _, data := range []*Data{&d.data, &d.rodata, &d.bss} {
+	for _, data := range []*Data{&d.data, &d.rodata, &d.bss, &d.noptrdata, &d.noptrbss} {
 		if off64 >= data.Start && off64 < data.End {
 			off64 -= data.Start
 			copy(buf, data.Data[off64:off64+len64])
@@ -838,6 +864,12 @@ func (d *Dump) link(exename string) error {
 	if obj.rodata != nil {
 		d.rodata = *obj.rodata
 	}
+	if obj.noptrdata != nil {
+		d.noptrdata = *obj.noptrdata
+	}
+	if obj.noptrbss != nil {
+		d.noptrbss = *obj.noptrbss
+	}
 
 	printer := NewPrinter(obj.architecture, obj.dwarfData, d)
 
@@ -846,14 +878,13 @@ func (d *Dump) link(exename string) error {
 		return err
 	}
 
-	// fmt.Printf("data:   %d\n", len(d.data.Data))
-	// fmt.Printf("rodata: %d\n", len(d.rodata.Data))
-	// fmt.Printf("bss:    %d\n", len(d.bss.Data))
+	// fmt.Printf("data:        %d\n", len(d.data.Data))
+	// fmt.Printf("rodata:      %d\n", len(d.rodata.Data))
+	// fmt.Printf("noptrdata:   %d\n", len(d.noptrdata.Data))
+	// fmt.Printf("bss:         %d\n", len(d.bss.Data))
+	// fmt.Printf("noptrbss:    %d\n", len(d.noptrbss.Data))
 
 	for _, g := range d.goroutines {
-		// if g.goid != 5 {
-		// 	continue
-		// }
 		fmt.Printf("goroutine %d\n", g.goid)
 		for _, f := range g.frames {
 			if file, line, fn := obj.symtab.PCToLine(f.pc - 1); fn != nil {
@@ -884,6 +915,49 @@ func (d *Dump) link(exename string) error {
 			}
 		}
 		fmt.Println()
+	}
+
+	for r := obj.dwarfData.Reader(); true; {
+		e, err := r.Next()
+		if err != nil || e == nil {
+			break
+		}
+		if e.Tag == dwarf.TagCompileUnit {
+			continue
+		}
+		if e.Tag == dwarf.TagVariable {
+			name, ok := e.Val(dwarf.AttrName).(string)
+			if !ok {
+				continue
+			}
+			if strings.HasPrefix(name, "main.") {
+				loc, ok := e.Val(dwarf.AttrLocation).([]byte)
+				if !ok {
+					continue
+				}
+				if len(loc) == 0 || loc[0] != opAddr {
+					continue
+				}
+				addr := d.uintptr(loc[1:])
+				typ, err := obj.dwarfData.Type(e.Val(dwarf.AttrType).(dwarf.Offset))
+				if err != nil {
+					fmt.Printf("ERROR: unable to find type: %s\n", name)
+					continue
+				}
+				if _, ok := typ.(*dwarf.UnspecifiedType); ok {
+					continue
+				}
+				s, err := printer.SprintEntry(e, address(addr))
+				if err != nil {
+					fmt.Printf("%#08x: %s %s [%s]\n", addr, e.Val(dwarf.AttrName), s, err)
+				} else {
+					fmt.Printf("%#08x: %s %s\n", addr, e.Val(dwarf.AttrName), s)
+				}
+			}
+		}
+		if e.Children {
+			r.SkipChildren()
+		}
 	}
 
 	return nil
