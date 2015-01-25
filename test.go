@@ -1,3 +1,25 @@
+// TODO(pmattis): Web UI for navigating heap dump
+//   - Source navigator (ala godoc)
+//     - Find code via gosym.Table.Files.
+//     - Detect if the source is newer than the binary.
+//   - List of goroutines (jump to source location)
+//     - Filter by regex.
+//   - Ability to walk up and down stacks.
+//   - Display of local variables and parameters.
+//   - Data structure navigator.
+//     - Display structure contents.
+//     - Expand/collapse pointers and interfaces.
+//   - Utilize multiple heap dumps taken in a single run of a program
+//     to step through time.
+//
+// TODO(pmattis): Small library to ease heap dump creation and write
+// heap dumps to files suffixed with process id:
+//   heapdump.<pid>.<timestamp>
+//
+// TODO(pmattis): Support both coredumps and heapdumps. Note that the
+// go runtime disables coredumps on Mac OS X (darwin) because of
+// extremely naive behavior from the kernel.
+
 package main
 
 import (
@@ -10,10 +32,14 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"time"
+
+	"go/parser"
+	"go/token"
 
 	"golang.org/x/debug/dwarf"
 	"golang.org/x/debug/elf"
@@ -39,7 +65,7 @@ func loadObjfile(path string) (*Objfile, error) {
 			return nil, err
 		}
 
-		// TODO(pmattis): Find rodata section.
+		// TODO(pmattis): rodata, noptrbss, noptrdata sections.
 
 		switch obj.Machine {
 		case elf.EM_ARM:
@@ -799,6 +825,11 @@ func makeLocalsMap(d *dwarf.Data) (localsMap, error) {
 }
 
 func (d *Dump) peek(offset uintptr, buf []byte) error {
+	// TODO(pmattis): This is currently inefficient and could be
+	// significantly improved by putting all of the "data" into a single
+	// array sorted by address and using binary search to find the
+	// desired address.
+
 	if offset == 0 {
 		for i := range buf {
 			buf[i] = 0
@@ -885,12 +916,11 @@ func (d *Dump) link(exename string) error {
 	// fmt.Printf("noptrbss:    %d\n", len(d.noptrbss.Data))
 
 	for _, g := range d.goroutines {
-		fmt.Printf("goroutine %d\n", g.goid)
+		fmt.Printf("goroutine %d [%s]\n", g.goid, g.waitReason)
 		for _, f := range g.frames {
+			fmt.Printf("%s\n", f.name)
 			if file, line, fn := obj.symtab.PCToLine(f.pc - 1); fn != nil {
-				fmt.Printf("  %s [%s:%d]\n", f.name, file, line)
-			} else {
-				fmt.Printf("  %s\n", f.name)
+				fmt.Printf("\t%s:%d\n", file, line)
 			}
 			vals, ok := locals[f.name]
 			if !ok {
@@ -906,13 +936,12 @@ func (d *Dump) link(exename string) error {
 				// "first" function invoked by a goroutine because the
 				// arguments are stored in the parent frame but the parent
 				// frame isn't properly sized.
-				s, err := printer.SprintEntry(v.entry, addr)
-				if err != nil {
-					fmt.Printf("    %4d %s %s [%s]\n", v.offset, v.name, s, err)
-					continue
-				}
-				fmt.Printf("    %4d %s %v %s\n", v.offset, v.name, typ, s)
+				s, _ := printer.SprintEntry(v.entry, addr)
+				fmt.Printf("\t%4d %s %v %s\n", v.offset, v.name, typ, s)
 			}
+		}
+		if file, line, fn := obj.symtab.PCToLine(g.gopc); fn != nil {
+			fmt.Printf("created by %s\n\t%s:%d\n", fn.Name, file, line)
 		}
 		fmt.Println()
 	}
@@ -960,6 +989,17 @@ func (d *Dump) link(exename string) error {
 		}
 	}
 
+	files := token.NewFileSet()
+	for p := range obj.symtab.Files {
+		if path.Ext(p) == ".go" {
+			f, err := parser.ParseFile(files, p, nil, parser.ParseComments)
+			if err != nil {
+				log.Fatalf("unable to parse: %s: %s\n", p, err)
+			}
+			fmt.Printf("%s: %s\n", f.Name.Name, p)
+		}
+	}
+
 	return nil
 }
 
@@ -990,6 +1030,7 @@ func boo() {
 }
 
 func main() {
+	// go foo(errors.New("hello"))
 	go boo()
 	time.Sleep(1)
 

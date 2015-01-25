@@ -310,7 +310,7 @@ func (p *Printer) printValueAt(typ dwarf.Type, a address) {
 		if b, ok := p.peekUint8(a); ok {
 			p.printf("%t", b != 0)
 		} else {
-			p.errorf("couldn't read bool")
+			p.errorf("couldn't read bool: %#x", a)
 		}
 	case *dwarf.PtrType:
 		if ptr, ok := p.peekPtr(a); ok {
@@ -326,24 +326,24 @@ func (p *Printer) printValueAt(typ dwarf.Type, a address) {
 				}
 			}
 		} else {
-			p.errorf("couldn't read pointer")
+			p.errorf("couldn't read pointer: %#x", a)
 		}
 	case *dwarf.IntType:
 		// Sad we can't tell a rune from an int32.
 		if i, ok := p.peekInt(a, typ.ByteSize); ok {
 			p.printf("%d", i)
 		} else {
-			p.errorf("couldn't read int")
+			p.errorf("couldn't read int: %#x", a)
 		}
 	case *dwarf.UintType:
 		if u, ok := p.peekUint(a, typ.ByteSize); ok {
 			p.printf("%d", u)
 		} else {
-			p.errorf("couldn't read uint")
+			p.errorf("couldn't read uint: %#x", a)
 		}
 	case *dwarf.FloatType:
 		if !p.peek(a, typ.ByteSize) {
-			p.errorf("couldn't read float")
+			p.errorf("couldn't read float: %#x", a)
 			return
 		}
 		switch typ.ByteSize {
@@ -356,7 +356,7 @@ func (p *Printer) printValueAt(typ dwarf.Type, a address) {
 		}
 	case *dwarf.ComplexType:
 		if !p.peek(a, typ.ByteSize) {
-			p.errorf("couldn't read complex")
+			p.errorf("couldn't read complex: %#x", a)
 			return
 		}
 		switch typ.ByteSize {
@@ -537,12 +537,12 @@ func (p *Printer) printTypeOfInterface(t dwarf.Type, a address) {
 	}
 	typeAddr, ok := p.peekPtrStructField(t3, a, "_type")
 	if !ok {
-		p.errorf("couldn't read type structure pointer")
+		p.errorf("couldn't read type structure pointer: %#x", a)
 		return
 	}
 	stringAddr, ok := p.peekPtrStructField(t6, typeAddr, "_string")
 	if !ok {
-		p.errorf("couldn't read type name")
+		p.errorf("couldn't read type name: %#x", typeAddr)
 		return
 	}
 	p.printStringAt(stringType, stringAddr)
