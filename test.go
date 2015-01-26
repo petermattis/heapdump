@@ -31,15 +31,12 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
-	"path"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"time"
-
-	"go/parser"
-	"go/token"
 
 	"golang.org/x/debug/dwarf"
 	"golang.org/x/debug/elf"
@@ -302,6 +299,7 @@ func readFields(r *bufio.Reader) []Field {
 
 // Dump ...
 type Dump struct {
+	objfile      *Objfile
 	byteOrder    binary.ByteOrder
 	ptrSize      uint64
 	heapStart    uint64
@@ -886,25 +884,25 @@ func (d *Dump) peek(offset uintptr, buf []byte) error {
 }
 
 func (d *Dump) link(exename string) error {
-	obj, err := loadObjfile(exename)
+	var err error
+	d.objfile, err = loadObjfile(exename)
 	if err != nil {
 		return err
 	}
-	// dumpDwarf(obj.dwarfData, obj.dwarfData.Reader(), "")
 
-	if obj.rodata != nil {
-		d.rodata = *obj.rodata
+	if d.objfile.rodata != nil {
+		d.rodata = *d.objfile.rodata
 	}
-	if obj.noptrdata != nil {
-		d.noptrdata = *obj.noptrdata
+	if d.objfile.noptrdata != nil {
+		d.noptrdata = *d.objfile.noptrdata
 	}
-	if obj.noptrbss != nil {
-		d.noptrbss = *obj.noptrbss
+	if d.objfile.noptrbss != nil {
+		d.noptrbss = *d.objfile.noptrbss
 	}
 
-	printer := NewPrinter(obj.architecture, obj.dwarfData, d)
+	printer := NewPrinter(d.objfile.architecture, d.objfile.dwarfData, d)
 
-	locals, err := makeLocalsMap(obj.dwarfData)
+	locals, err := makeLocalsMap(d.objfile.dwarfData)
 	if err != nil {
 		return err
 	}
@@ -919,7 +917,7 @@ func (d *Dump) link(exename string) error {
 		fmt.Printf("goroutine %d [%s]\n", g.goid, g.waitReason)
 		for _, f := range g.frames {
 			fmt.Printf("%s\n", f.name)
-			if file, line, fn := obj.symtab.PCToLine(f.pc - 1); fn != nil {
+			if file, line, fn := d.objfile.symtab.PCToLine(f.pc - 1); fn != nil {
 				fmt.Printf("\t%s:%d\n", file, line)
 			}
 			vals, ok := locals[f.name]
@@ -927,7 +925,7 @@ func (d *Dump) link(exename string) error {
 				continue
 			}
 			for _, v := range vals {
-				typ, err := obj.dwarfData.Type(v.entry.Val(dwarf.AttrType).(dwarf.Offset))
+				typ, err := d.objfile.dwarfData.Type(v.entry.Val(dwarf.AttrType).(dwarf.Offset))
 				if err != nil {
 					continue
 				}
@@ -940,13 +938,13 @@ func (d *Dump) link(exename string) error {
 				fmt.Printf("\t%4d %s %v %s\n", v.offset, v.name, typ, s)
 			}
 		}
-		if file, line, fn := obj.symtab.PCToLine(g.gopc); fn != nil {
+		if file, line, fn := d.objfile.symtab.PCToLine(g.gopc); fn != nil {
 			fmt.Printf("created by %s\n\t%s:%d\n", fn.Name, file, line)
 		}
 		fmt.Println()
 	}
 
-	for r := obj.dwarfData.Reader(); true; {
+	for r := d.objfile.dwarfData.Reader(); true; {
 		e, err := r.Next()
 		if err != nil || e == nil {
 			break
@@ -968,7 +966,7 @@ func (d *Dump) link(exename string) error {
 					continue
 				}
 				addr := d.uintptr(loc[1:])
-				typ, err := obj.dwarfData.Type(e.Val(dwarf.AttrType).(dwarf.Offset))
+				typ, err := d.objfile.dwarfData.Type(e.Val(dwarf.AttrType).(dwarf.Offset))
 				if err != nil {
 					fmt.Printf("ERROR: unable to find type: %s\n", name)
 					continue
@@ -989,17 +987,6 @@ func (d *Dump) link(exename string) error {
 		}
 	}
 
-	files := token.NewFileSet()
-	for p := range obj.symtab.Files {
-		if path.Ext(p) == ".go" {
-			f, err := parser.ParseFile(files, p, nil, parser.ParseComments)
-			if err != nil {
-				log.Fatalf("unable to parse: %s: %s\n", p, err)
-			}
-			fmt.Printf("%s: %s\n", f.Name.Name, p)
-		}
-	}
-
 	return nil
 }
 
@@ -1011,6 +998,51 @@ func (d *Dump) uintptr(buf []byte) uint64 {
 		return d.byteOrder.Uint64(buf[:8])
 	}
 	panic(fmt.Errorf("invalid pointer size: %d", d.ptrSize))
+}
+
+// PostMortem ...
+type PostMortem struct {
+	dump *Dump
+}
+
+// NewPostMortem ...
+func NewPostMortem(dump *Dump) *PostMortem {
+	// TODO(pmattis): Parse all of the files listed in the
+	// symtab. Create a map from path *ast.File.
+	//
+	// Map "/" to welcome page (list of goroutines,
+
+	// files := token.NewFileSet()
+	// for p := range d.objfile.symtab.Files {
+	// 	if path.Ext(p) == ".go" && path.IsAbs(p) {
+	// 		_, err := parser.ParseFile(files, p, nil, parser.ParseComments)
+	// 		if err != nil {
+	// 			log.Fatalf("unable to parse: %s: %s\n", p, err)
+	// 		}
+	// 	}
+	// }
+
+	return &PostMortem{dump}
+}
+
+// ListenAndServe ...
+func (p *PostMortem) ListenAndServe() {
+	router := http.NewServeMux()
+	router.HandleFunc("/", p.serveHTTP)
+
+	s := &http.Server{
+		Addr:           "localhost:8080",
+		Handler:        router,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20,
+	}
+	log.Fatal(s.ListenAndServe())
+}
+
+func (p *PostMortem) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte("hello world\n"))
 }
 
 func baz(a error, b int, c string) {
@@ -1049,7 +1081,12 @@ func main() {
 	if _, err := f.Seek(0, 0); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := read(f, os.Args[0]); err != nil {
+
+	d, err := read(f, os.Args[0])
+	if err != nil {
 		log.Fatal(err)
 	}
+
+	p := NewPostMortem(d)
+	p.ListenAndServe()
 }
